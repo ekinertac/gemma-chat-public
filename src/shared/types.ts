@@ -26,6 +26,14 @@ export interface ToolCall {
 
 export type Role = 'user' | 'assistant' | 'system' | 'tool'
 
+export interface TokenUsage {
+  promptTokens: number
+  completionTokens: number
+  totalTokens: number
+  tokensPerSecond?: number
+  contextMaxTokens?: number
+}
+
 export interface ChatMessage {
   id: string
   role: Role
@@ -35,6 +43,7 @@ export interface ChatMessage {
   model?: string
   done?: boolean
   activity?: AgentActivity
+  usage?: TokenUsage
 }
 
 export type AgentMode = 'chat' | 'code'
@@ -74,6 +83,7 @@ export type StreamChunk =
   | { type: 'tool_call'; call: ToolCall }
   | { type: 'tool_result'; id: string; result?: string; error?: string }
   | { type: 'activity'; activity: AgentActivity }
+  | { type: 'usage'; usage: TokenUsage }
   | { type: 'done' }
   | { type: 'error'; error: string }
 

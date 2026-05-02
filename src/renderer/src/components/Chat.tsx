@@ -180,6 +180,8 @@ export default function Chat({ model, onSwitchModel }: Props) {
                 msgs[msgs.length - 1] = { ...last, toolCalls: tcs }
               } else if (chunk.type === 'activity') {
                 msgs[msgs.length - 1] = { ...last, activity: chunk.activity }
+              } else if (chunk.type === 'usage') {
+                msgs[msgs.length - 1] = { ...last, usage: chunk.usage }
               } else if (chunk.type === 'done') {
                 msgs[msgs.length - 1] = { ...last, done: true, activity: { kind: 'idle' } }
               } else if (chunk.type === 'error') {

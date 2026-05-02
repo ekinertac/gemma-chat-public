@@ -32,7 +32,7 @@ import {
   workspaceDir,
   wsWriteFile
 } from './workspace'
-import type { ChatRequest, StreamChunk, ToolCall } from '../shared/types'
+import type { ChatRequest, StreamChunk, ToolCall, TokenUsage } from '../shared/types'
 
 let mainWindow: BrowserWindow | null = null
 
@@ -191,6 +191,10 @@ async function handleChat(req: ChatRequest, channel: string): Promise<void> {
     const maxRounds = req.mode === 'code' ? MAX_TOOL_ROUNDS_CODE : MAX_TOOL_ROUNDS_CHAT
 
     emit({ type: 'activity', activity: { kind: 'thinking', chars: 0 } })
+
+    // Accumulate usage stats across all rounds (tool loops re-request)
+    const usageAccum = { promptTokens: 0, completionTokens: 0 }
+    let generationStartTs = Date.now()
 
     for (let round = 0; round < maxRounds; round++) {
       let buffer = ''
@@ -401,6 +405,10 @@ async function handleChat(req: ChatRequest, channel: string): Promise<void> {
             break streamLoop
           }
         }
+        if (chunk.usage) {
+          usageAccum.promptTokens += chunk.usage.prompt_tokens
+          usageAccum.completionTokens += chunk.usage.completion_tokens
+        }
         if (chunk.done) {
           break streamLoop
         }
@@ -423,6 +431,16 @@ async function handleChat(req: ChatRequest, channel: string): Promise<void> {
           emit({ type: 'activity', activity: { kind: 'thinking', chars: 0 } })
           continue // go to round 1
         }
+        const elapsedSec = (Date.now() - generationStartTs) / 1000
+        const tps = elapsedSec > 0 ? usageAccum.completionTokens / elapsedSec : 0
+        const usage: TokenUsage = {
+          promptTokens: usageAccum.promptTokens,
+          completionTokens: usageAccum.completionTokens,
+          totalTokens: usageAccum.promptTokens + usageAccum.completionTokens,
+          tokensPerSecond: Math.round(tps * 10) / 10,
+          contextMaxTokens: 131072
+        }
+        emit({ type: 'usage', usage })
         emit({ type: 'activity', activity: { kind: 'idle' } })
         emit({ type: 'done' })
         return

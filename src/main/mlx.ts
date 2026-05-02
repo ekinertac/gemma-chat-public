@@ -1,7 +1,7 @@
 import { app } from 'electron'
-import { spawn, ChildProcess, spawnSync } from 'child_process'
+import { spawn, execSync, ChildProcess, spawnSync } from 'child_process'
 import { join } from 'path'
-import { existsSync, rmSync } from 'fs'
+import { existsSync, rmSync, readdirSync, writeFileSync, mkdirSync } from 'fs'
 
 const MLX_PORT = 11434
 const MLX_HOST = `127.0.0.1:${MLX_PORT}`
@@ -29,6 +29,55 @@ function venvPython(): string {
 
 function modelsDir(): string {
   return join(dataDir(), 'models')
+}
+
+function serverScript(): string {
+  return join(dataDir(), 'server_wrapper.py')
+}
+
+// ---------------------------------------------------------------------------
+// Runtime patch — Gemma 4 KV-shared-layer weight compatibility
+// ---------------------------------------------------------------------------
+// mlx-lm's gemma4_text sanitize() doesn't strip KV weights for shared layers,
+// but some quantised checkpoints include them. This wrapper monkey-patches the
+// sanitizer before starting the server so the model loads cleanly.
+
+const SERVER_WRAPPER = `\
+import re, sys, importlib
+
+def _patch_gemma4():
+    try:
+        mod = importlib.import_module("mlx_lm.models.gemma4_text")
+    except ImportError:
+        return
+    ModelCls = getattr(mod, "Model", None)
+    if ModelCls is None:
+        return
+    _orig_sanitize = ModelCls.sanitize
+    _kv_re = re.compile(
+        r"language_model\\.model\\.layers\\.(\\d+)\\.self_attn\\.(k_proj|v_proj|k_norm)\\b"
+    )
+    def _patched_sanitize(self, weights):
+        first_shared = self.args.num_hidden_layers - self.args.num_kv_shared_layers
+        if first_shared > 0:
+            weights = {
+                k: v for k, v in weights.items()
+                if not (lambda m: m and int(m.group(1)) >= first_shared)(_kv_re.search(k))
+            }
+        return _orig_sanitize(self, weights)
+    ModelCls.sanitize = _patched_sanitize
+
+_patch_gemma4()
+
+from mlx_lm.server import main
+main()
+`
+
+function ensureServerScript(): string {
+  const p = serverScript()
+  mkdirSync(dataDir(), { recursive: true })
+  writeFileSync(p, SERVER_WRAPPER, 'utf-8')
+  return p
 }
 
 // ---------------------------------------------------------------------------
@@ -276,6 +325,9 @@ export async function startServer(
   // Kill existing server if running with different model
   stopServer()
 
+  // Kill any orphaned process still holding the port from a previous app run
+  killPortHolder(MLX_PORT)
+
   const env = {
     ...process.env,
     // HuggingFace cache dir — keep models in our app data
@@ -288,11 +340,12 @@ export async function startServer(
   let earlyExit: { code: number | null; stderr: string } | null = null
   let stderrBuf = ''
 
-  console.log(`[mlx] Starting server: ${python} -m mlx_lm.server --model ${model} --port ${MLX_PORT}`)
+  const wrapper = ensureServerScript()
+  console.log(`[mlx] Starting server: ${python} ${wrapper} --model ${model} --port ${MLX_PORT}`)
 
   serverProc = spawn(
     python,
-    ['-m', 'mlx_lm.server', '--model', model, '--port', String(MLX_PORT)],
+    [wrapper, '--model', model, '--port', String(MLX_PORT)],
     {
       env,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -353,6 +406,19 @@ export function stopServer(): void {
   }
 }
 
+/** Kill any process listening on the given port (cleans up orphaned servers). */
+function killPortHolder(port: number): void {
+  try {
+    const pid = execSync(`lsof -ti :${port}`, { timeout: 3000 }).toString().trim()
+    if (pid) {
+      console.log(`[mlx] Killing orphaned process ${pid} on port ${port}`)
+      process.kill(parseInt(pid, 10), 'SIGTERM')
+    }
+  } catch {
+    // No process on that port — nothing to do
+  }
+}
+
 /**
  * Poll the server's /v1/models endpoint until it responds.
  * If the server process exits early, throw immediately.
@@ -392,11 +458,34 @@ async function waitForHealth(
 // ---------------------------------------------------------------------------
 
 export async function listLocalModels(): Promise<string[]> {
+  // First try the running server
   try {
     const res = await fetch(`${MLX_URL}/v1/models`)
-    if (!res.ok) return []
-    const data = (await res.json()) as { data?: Array<{ id: string }> }
-    return (data.data ?? []).map((m) => m.id)
+    if (res.ok) {
+      const data = (await res.json()) as { data?: Array<{ id: string }> }
+      const ids = (data.data ?? []).map((m) => m.id)
+      if (ids.length > 0) return ids
+    }
+  } catch {
+    // Server not running — fall through to disk check
+  }
+
+  // Fall back to scanning the HuggingFace cache directory on disk.
+  // HF stores models as directories named "models--<org>--<repo>".
+  return listCachedModels()
+}
+
+/**
+ * Scan the HuggingFace cache on disk for downloaded models.
+ * Cache dirs follow the pattern: models--<org>--<repo>
+ */
+export function listCachedModels(): string[] {
+  const hubDir = join(modelsDir(), 'hub')
+  if (!existsSync(hubDir)) return []
+  try {
+    return readdirSync(hubDir, { withFileTypes: true })
+      .filter((d) => d.isDirectory() && d.name.startsWith('models--'))
+      .map((d) => d.name.replace(/^models--/, '').replace(/--/g, '/'))
   } catch {
     return []
   }
@@ -428,9 +517,15 @@ export interface MLXChatOptions {
   temperature?: number
 }
 
+export interface ChatStreamEvent {
+  content?: string
+  done?: boolean
+  usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number }
+}
+
 export async function* chatStream(
   opts: MLXChatOptions
-): AsyncGenerator<{ content?: string; done?: boolean }> {
+): AsyncGenerator<ChatStreamEvent> {
   const res = await fetch(`${MLX_URL}/v1/chat/completions`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -441,6 +536,7 @@ export async function* chatStream(
         content: m.content
       })),
       stream: true,
+      stream_options: { include_usage: true },
       temperature: opts.temperature ?? 0.7,
       max_tokens: 8192
     }),
@@ -465,7 +561,14 @@ export async function* chatStream(
           delta?: { content?: string; role?: string }
           finish_reason?: string | null
         }>
+        usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number }
       }
+
+      // Usage stats arrive in a separate event (empty choices) before [DONE]
+      if (parsed.usage) {
+        yield { usage: parsed.usage }
+      }
+
       const choice = parsed.choices?.[0]
       if (choice?.delta?.content) {
         yield { content: choice.delta.content }

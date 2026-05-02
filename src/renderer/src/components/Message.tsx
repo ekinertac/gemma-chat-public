@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { marked } from 'marked'
-import type { AgentActivity, ChatMessage, ToolCall } from '@shared/types'
+import type { AgentActivity, ChatMessage, TokenUsage, ToolCall } from '@shared/types'
 import gemmaLogoUrl from '../assets/gemma-logo.png'
 
 interface Props {
@@ -97,6 +97,8 @@ export default function Message({
             <span />
           </div>
         )}
+
+        {message.done && message.usage && <UsageStats usage={message.usage} />}
 
         {onRegenerate && (
           <div className="mt-2 flex gap-1 opacity-0 transition group-hover:opacity-100">
@@ -380,6 +382,27 @@ function ToolCallView({ call }: { call: ToolCall }) {
           {call.error && <div className="text-red-400">{call.error}</div>}
         </div>
       )}
+    </div>
+  )
+}
+
+function UsageStats({ usage }: { usage: TokenUsage }) {
+  const ctxPct =
+    usage.contextMaxTokens && usage.contextMaxTokens > 0
+      ? Math.round((usage.totalTokens / usage.contextMaxTokens) * 100)
+      : null
+  const parts: string[] = []
+  parts.push(`${usage.promptTokens} in`)
+  parts.push(`${usage.completionTokens} out`)
+  if (usage.tokensPerSecond != null && usage.tokensPerSecond > 0) {
+    parts.push(`${usage.tokensPerSecond} tok/s`)
+  }
+  if (ctxPct != null && usage.contextMaxTokens) {
+    parts.push(`${ctxPct}% of ${(usage.contextMaxTokens / 1024).toFixed(0)}k ctx`)
+  }
+  return (
+    <div className="mt-1.5 text-[11px] tabular-nums text-ink-400/50">
+      {parts.join(' · ')}
     </div>
   )
 }
