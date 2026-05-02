@@ -476,15 +476,26 @@ export async function listLocalModels(): Promise<string[]> {
 }
 
 /**
- * Scan the HuggingFace cache on disk for downloaded models.
- * Cache dirs follow the pattern: models--<org>--<repo>
+ * Scan the HuggingFace cache on disk for fully downloaded models.
+ * A model is considered complete only when its snapshot contains
+ * the weights file (model.safetensors or model-*.safetensors).
  */
 export function listCachedModels(): string[] {
   const hubDir = join(modelsDir(), 'hub')
   if (!existsSync(hubDir)) return []
   try {
     return readdirSync(hubDir, { withFileTypes: true })
-      .filter((d) => d.isDirectory() && d.name.startsWith('models--'))
+      .filter((d) => {
+        if (!d.isDirectory() || !d.name.startsWith('models--')) return false
+        const snapshotsDir = join(hubDir, d.name, 'snapshots')
+        if (!existsSync(snapshotsDir)) return false
+        const revisions = readdirSync(snapshotsDir, { withFileTypes: true })
+          .filter((r) => r.isDirectory())
+        return revisions.some((rev) => {
+          const files = readdirSync(join(snapshotsDir, rev.name))
+          return files.some((f) => f.startsWith('model') && f.endsWith('.safetensors'))
+        })
+      })
       .map((d) => d.name.replace(/^models--/, '').replace(/--/g, '/'))
   } catch {
     return []
